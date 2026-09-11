@@ -122,7 +122,7 @@ partner_review = data["partner_review"]
 # Sidebar: identity / access simulation + filters (Section 6, 19)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.markdown("**View as** *(simulates login/access — Phase 5 replaces this with real auth)*")
+st.sidebar.markdown("**View as** *(simulates login/access")
 role = st.sidebar.selectbox("Role", ["Admin", "Cluster Manager", "RM", "Partner"])
 
 filtered_partners = partner_master.copy()
