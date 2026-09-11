@@ -10,6 +10,7 @@ Deploy free:   push this folder to GitHub, then deploy on
 """
 
 from datetime import date
+import calendar
 import os
 
 import pandas as pd
@@ -21,6 +22,9 @@ from data_layer import get_all_data, TODAY as DEMO_TODAY
 from formatting import format_inr, format_count, format_pct, status_from_achievement, STATUS_COLOR
 import calculations as calc
 import excel_loader
+import consolidate
+import report_export
+from income_projection import ProjectionInputs, CrossSellAssumption, simulate, milestone_years
 
 # ---------------------------------------------------------------------------
 # Page config & light theming
@@ -67,7 +71,10 @@ st.sidebar.caption("Wealth Management Partner Tracker — Prototype")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Data Source**")
 source_mode = st.sidebar.radio(
-    "Source", ["Sample Data (demo)", "Upload Daily Excel", "Auto-load from folder"],
+    "Source", [
+        "Sample Data (demo)", "Upload Daily Excel", "Auto-load from folder",
+        "Load Processed Data (Consolidated)",
+    ],
     label_visibility="collapsed",
 )
 
@@ -94,7 +101,7 @@ elif source_mode == "Upload Daily Excel":
         st.stop()
     TODAY = date.today()
 
-else:  # Auto-load from folder
+elif source_mode == "Auto-load from folder":
     folder = st.sidebar.text_input("Folder path", value="/data", help="A location this server can read — see README.")
     latest = excel_loader.find_latest_file(folder)
     if latest is None:
@@ -111,6 +118,26 @@ else:  # Auto-load from folder
     TODAY = date.today()
     st.sidebar.caption(f"Auto-loaded: {os.path.basename(latest)}")
 
+else:  # Load Processed Data (Consolidated) — for the 120-RM pipeline
+    processed_folder = st.sidebar.text_input(
+        "Processed data folder", value="./processed_data",
+        help="Output of consolidate.py — run that script against your Central Data Folder first.",
+    )
+    data, run_report, err = consolidate.load_processed(processed_folder)
+    if err:
+        st.error(err)
+        st.caption("Run this from the project folder, on a server that can see your Central Data Folder:\n\n"
+                   "`python consolidate.py --raw-folder ./raw_data --out-folder ./processed_data`")
+        st.stop()
+    TODAY = date.today()
+    if run_report:
+        st.sidebar.success(f"Consolidated {run_report['row_counts']['transaction_fact']:,} transactions "
+                            f"from {len(run_report['files_ok'])} file(s) — {run_report['run_at']}")
+        if run_report["files_failed"]:
+            with st.sidebar.expander(f"⚠️ {len(run_report['files_failed'])} file(s) skipped"):
+                for f in run_report["files_failed"]:
+                    st.write(f"**{f['file']}**: {f['error']}")
+
 partner_master = data["partner_master"]
 client_master = data["client_master"]
 transaction_fact = data["transaction_fact"]
@@ -122,7 +149,7 @@ partner_review = data["partner_review"]
 # Sidebar: identity / access simulation + filters (Section 6, 19)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.markdown("**View as** *(simulates login/access")
+st.sidebar.markdown("**View as** *(simulates login/access — Phase 5 replaces this with real auth)*")
 role = st.sidebar.selectbox("Role", ["Admin", "Cluster Manager", "RM", "Partner"])
 
 filtered_partners = partner_master.copy()
@@ -164,8 +191,12 @@ section = st.sidebar.radio(
         "6. Growth & Trends",
         "7. Opportunity / Gap Analysis",
         "8. Partner Review",
-        "9. Action Tracker",
-        "10. Download / Reports",
+        "9. Review History",
+        "10. Income Calculator",
+        "11. Target Projection",
+        "12. Final Target Submission",
+        "13. Action Tracker",
+        "14. Download / Reports",
     ],
 )
 
@@ -533,10 +564,12 @@ elif section.startswith("7."):
 elif section.startswith("8."):
     st.subheader("Partner Review")
 
-    if reviews.empty:
-        st.info("No review entries logged for this selection yet.")
+    open_reviews = reviews[reviews["status"].isin(["Open", "In Progress"])] if not reviews.empty else reviews
+    if open_reviews.empty:
+        st.info("No open review items for this selection.")
     else:
-        show = reviews.merge(partner_master[["partner_id", "partner_name"]], on="partner_id", how="left")
+        show = open_reviews.merge(partner_master[["partner_id", "partner_name"]], on="partner_id", how="left")
+        st.caption(f"{len(show)} open item(s) in scope")
         st.dataframe(
             show[["partner_name", "review_date", "problem_discussed", "approach", "status"]]
             .rename(columns={
@@ -546,6 +579,7 @@ elif section.startswith("8."):
             }),
             use_container_width=True, hide_index=True,
         )
+    st.caption("For the full history of past reviews, see the **Review History** section.")
 
     st.markdown("---")
     st.subheader("Log a New Review")
@@ -567,9 +601,253 @@ elif section.startswith("8."):
 
 
 # ===========================================================================
-# SECTION 9 — ACTION TRACKER
+# SECTION 9 — REVIEW HISTORY
 # ===========================================================================
 elif section.startswith("9."):
+    st.subheader("Review History")
+
+    if reviews.empty:
+        st.info("No review history for this selection.")
+    else:
+        show = reviews.merge(partner_master[["partner_id", "partner_name"]], on="partner_id", how="left").copy()
+        show["review_date"] = pd.to_datetime(show["review_date"])
+
+        colf1, colf2 = st.columns(2)
+        status_filter = colf1.multiselect("Filter by status", sorted(show["status"].unique().tolist()))
+        date_range = colf2.date_input("Filter by review date range", value=())
+
+        filtered = show.copy()
+        if status_filter:
+            filtered = filtered[filtered["status"].isin(status_filter)]
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start, end = date_range
+            filtered = filtered[(filtered["review_date"].dt.date >= start) & (filtered["review_date"].dt.date <= end)]
+
+        filtered = filtered.sort_values("review_date", ascending=False)
+        st.caption(f"{len(filtered)} of {len(show)} review(s) shown, most recent first")
+
+        for _, r in filtered.iterrows():
+            with st.expander(f"{r['review_date'].strftime('%d %b %Y')} — {r['partner_name']} — {r['problem_discussed']} ({r['status']})"):
+                c1, c2 = st.columns(2)
+                c1.markdown(f"**Approach / Way Forward:** {r['approach']}")
+                c1.markdown(f"**Action Item:** {r['action_item']}")
+                c2.markdown(f"**Owner:** {r['owner']}")
+                c2.markdown(f"**Due Date:** {r['due_date']}")
+                if r.get("remarks"):
+                    st.markdown(f"**Remarks:** {r['remarks']}")
+
+
+# ===========================================================================
+# SECTION 10 — INCOME CALCULATOR
+# ===========================================================================
+elif section.startswith("10."):
+    st.subheader("Partner Income Calculator")
+    st.caption("A long-horizon business-planning tool: project trail income and AUM growth from a client-acquisition "
+               "pace and SIP/lumpsum assumptions — independent of actual transaction data. Configure your real "
+               "payout/commission structure with Finance before sharing externally; the defaults below are illustrative.")
+
+    if st.button("↺ Reset to defaults", key="income_calc_reset"):
+        for k in list(st.session_state.keys()):
+            if k.startswith("ic_"):
+                del st.session_state[k]
+        st.rerun()
+
+    col_inputs, col_results = st.columns([1, 2.6])
+
+    with col_inputs:
+        st.markdown("**Your Book**")
+        starting_clients = st.number_input("Starting Clients", min_value=0, value=0, step=1, key="ic_start_clients")
+        starting_aum_cr = st.number_input("Starting AUM (₹ Cr)", min_value=0.0, value=0.0, step=1.0, key="ic_start_aum")
+        new_clients_pm = st.number_input("New Clients / Month", min_value=0, value=5, step=1, key="ic_new_clients")
+        sip_per_client = st.number_input("SIP / Client / Month (₹)", min_value=0, value=5000, step=500, key="ic_sip_amt")
+        sip_stepup = st.number_input("SIP Step-up % p.a.", min_value=0.0, value=1.0, step=0.5, key="ic_sip_stepup")
+        lumpsum_amt = st.number_input("Annual Lumpsum / Client (₹)", min_value=0, value=10000, step=1000, key="ic_lumpsum")
+        lumpsum_stepup = st.number_input("Lumpsum Step-up % p.a.", min_value=0.0, value=0.0, step=0.5, key="ic_lumpsum_stepup")
+        redemption_pct = st.number_input("Annual Redemption %", min_value=0.0, value=5.0, step=0.5, key="ic_redemption")
+        active_years = st.number_input("Active Years (effort)", min_value=1, max_value=40, value=25, step=1, key="ic_years")
+
+        st.markdown("**Assumptions**")
+        trail_rate = st.number_input("Trail Rate % p.a.", min_value=0.0, value=0.7, step=0.1, key="ic_trail")
+        market_cagr = st.number_input("Market CAGR % p.a.", min_value=0.0, value=12.0, step=0.5, key="ic_cagr")
+
+        st.markdown("**Cross-Sell Income** *(toggle to add)*")
+        life_on = st.toggle("Life Insurance — 40% commission", key="ic_life_on")
+        health_on = st.toggle("Health Insurance — 30% commission", key="ic_health_on")
+        pms_on = st.toggle("PMS — 1% commission", key="ic_pms_on")
+        demat_on = st.toggle("Demat & Broking — ₹210/client/mo", key="ic_demat_on")
+
+    inputs = ProjectionInputs(
+        starting_clients=starting_clients,
+        starting_aum=starting_aum_cr * 1_00_00_000,
+        new_clients_per_month=new_clients_pm,
+        sip_per_client_month=sip_per_client,
+        sip_stepup_pct=sip_stepup,
+        annual_lumpsum_per_client=lumpsum_amt,
+        lumpsum_stepup_pct=lumpsum_stepup,
+        annual_redemption_pct=redemption_pct,
+        active_years=int(active_years),
+        trail_rate_pct=trail_rate,
+        market_cagr_pct=market_cagr,
+        life=CrossSellAssumption(enabled=life_on, commission_pct=40, rate=10),
+        health=CrossSellAssumption(enabled=health_on, commission_pct=30, rate=15),
+        pms=CrossSellAssumption(enabled=pms_on, commission_pct=1, rate=5),
+        demat=CrossSellAssumption(enabled=demat_on, rate=210),
+    )
+    projection = simulate(inputs)
+    milestones = milestone_years(int(active_years))
+
+    with col_results:
+        highlight_year = st.selectbox("Highlight year", milestones, index=min(3, len(milestones) - 1))
+        hy = projection[highlight_year - 1]
+        y5 = projection[min(5, len(projection)) - 1]
+        y_last = projection[-1]
+
+        st.markdown(f"""
+        <div class='insight-card'>🎯 By <b>Year {highlight_year}</b>, projected annual income is
+        <b>{format_inr(hy['total_income'])}</b> ({format_inr(hy['total_income']/12)}/mo) —
+        roughly a <b>{format_inr(hy['total_income'])} p.a.</b> equivalent.
+        <span style='float:right;color:#6b7280'>Year {min(5,len(projection))}: {format_inr(y5['total_income'])}/yr ·
+        Year {y_last['year']}: {format_inr(y_last['total_income'])}/yr</span></div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(f"**{active_years}-Year Income Projections** — {len(milestones)} milestones")
+        table_rows = []
+        for y in milestones:
+            r = projection[y - 1]
+            table_rows.append({
+                "Year": y, "Clients": format_count(r["clients"]),
+                "SIP Contrib.": format_inr(r["sip_contrib"]),
+                "Step-up Inflows": format_inr(r["stepup_inflow"]) if r["stepup_inflow"] else "—",
+                "Lumpsum / Yr": format_inr(r["lumpsum"]),
+                "Mkt. Gains": format_inr(r["mkt_gains"]),
+                "Total AUM": format_inr(r["total_aum"]),
+                "SIP Book /Mo": format_inr(r["sip_book_mo"]),
+                "Trail / Yr": format_inr(r["trail_yr"]),
+                "Cross-sell / Yr": format_inr(r["cross_sell_total"]) if r["cross_sell_total"] else "—",
+                "Demat / Yr": format_inr(r["demat_yr"]) if r["demat_yr"] else "—",
+                "Total Income": format_inr(r["total_income"]),
+                "Uplift": format_pct(r["uplift_pct"]) if r["uplift_pct"] is not None else "—",
+            })
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+        st.caption(f"Illustrative projections. Actual returns depend on market conditions and client activity. "
+                   f"Trail: {trail_rate}% p.a. · Market CAGR: {market_cagr}% · "
+                   f"Cross-sell: Life 40% · Health 30% · PMS 1% (of AUM) · Demat ₹210/active client/mo.")
+
+    st.markdown("---")
+    chart_years = [r["year"] for r in projection]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig = go.Figure()
+        fig.add_bar(x=chart_years, y=[r["trail_yr"] for r in projection], name="Trail")
+        fig.add_bar(x=chart_years, y=[r["cross_sell_total"] for r in projection], name="Cross-Sell")
+        fig.add_bar(x=chart_years, y=[r["demat_yr"] for r in projection], name="Demat")
+        fig.update_layout(barmode="stack", title="Total Income Growth")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = go.Figure()
+        fig.add_bar(x=chart_years, y=[r["fresh_investment_cum"] for r in projection], name="Fresh Investment")
+        fig.add_bar(x=chart_years, y=[r["market_gains_cum"] for r in projection], name="Market Appreciation")
+        fig.update_layout(barmode="stack", title="AUM Composition")
+        st.plotly_chart(fig, use_container_width=True)
+    with c3:
+        fig = go.Figure()
+        totals = [max(r["total_income"], 1) for r in projection]
+        fig.add_bar(x=chart_years, y=[100 * r["trail_yr"] / t for r, t in zip(projection, totals)], name="Trail")
+        fig.add_bar(x=chart_years, y=[100 * r["cross_sell_total"] / t for r, t in zip(projection, totals)], name="Cross-sell")
+        fig.add_bar(x=chart_years, y=[100 * r["demat_yr"] / t for r, t in zip(projection, totals)], name="Demat")
+        fig.update_layout(barmode="stack", title="Income Mix %", yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ===========================================================================
+# SECTION 11 — TARGET PROJECTION (what-if, current period)
+# ===========================================================================
+elif section.startswith("11."):
+    st.subheader("Target Projection")
+    st.caption(f"What-if calculator for {month_sel} {year_sel}: enter an assumed run-rate for the rest of the "
+               f"period and see the projected achievement — separate from the Income Calculator's long-horizon view.")
+
+    days_in_month = calendar.monthrange(period_start.year, period_start.month)[1]
+    as_of_day = TODAY.day if (period_start.year, period_start.month) == (TODAY.year, TODAY.month) else days_in_month
+    days_elapsed = min(as_of_day, days_in_month)
+    days_remaining = days_in_month - days_elapsed
+    st.caption(f"{days_elapsed} day(s) elapsed, {days_remaining} day(s) remaining in the period.")
+
+    for _, row in target_summary.iterrows():
+        metric, target_val, actual_val = row["Metric"], row["Target"], row["Actual"]
+        current_daily_rate = actual_val / days_elapsed if days_elapsed else 0
+        with st.expander(f"{metric} — current MTD: {format_count(actual_val) if metric == 'New Clients' else format_inr(actual_val)}", expanded=(metric == "Sales")):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                assumed_rate = st.number_input(
+                    f"Assumed daily rate for remaining {days_remaining} day(s)",
+                    min_value=0.0, value=float(round(current_daily_rate, 2)),
+                    key=f"proj_rate_{metric}",
+                    help="Defaults to the current run-rate — adjust to model a faster or slower finish.",
+                )
+            projected_total = actual_val + assumed_rate * days_remaining
+            proj_ach = calc.achievement_pct(projected_total, target_val)
+            proj_gap = calc.gap(projected_total, target_val)
+            fmt = format_count if metric == "New Clients" else format_inr
+            with c2:
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Projected Total", fmt(projected_total))
+                cc2.metric("Projected Achievement", format_pct(proj_ach) if proj_ach is not None else "—")
+                cc3.metric("Projected Gap", fmt(proj_gap) if proj_gap is not None else "—")
+                if proj_ach is not None:
+                    st.progress(min(int(proj_ach), 100), text=status_from_achievement(proj_ach))
+
+
+# ===========================================================================
+# SECTION 12 — FINAL TARGET SUBMISSION
+# ===========================================================================
+elif section.startswith("12."):
+    st.subheader("Final Target Submission")
+    st.caption(f"Submit {month_sel} {year_sel} targets for {header_name}. Submissions save for this session and can "
+               f"be edited again later — nothing is locked. Wire this to a persisted store (DB / Google Sheet) in "
+               f"Phase 3 so submissions survive across sessions; for now, download the CSV below to hand off.")
+
+    if "submitted_targets" not in st.session_state:
+        st.session_state.submitted_targets = {}
+
+    with st.form("final_target_form"):
+        cols = st.columns(4)
+        sales_t = cols[0].number_input("Sales Target (₹)", min_value=0.0, value=float(
+            targets_month.loc[targets_month["target_type"] == "Sales", "target_value"].sum()), step=100000.0)
+        sip_t = cols[1].number_input("SIP Target (₹)", min_value=0.0, value=float(
+            targets_month.loc[targets_month["target_type"] == "SIP", "target_value"].sum()), step=10000.0)
+        insurance_t = cols[2].number_input("Insurance Target (₹)", min_value=0.0, value=float(
+            targets_month.loc[targets_month["target_type"] == "Insurance", "target_value"].sum()), step=10000.0)
+        new_clients_t = cols[3].number_input("New Clients Target", min_value=0, value=int(
+            targets_month.loc[targets_month["target_type"] == "New Clients", "target_value"].sum()), step=1)
+        submit = st.form_submit_button("Submit Final Target")
+        if submit:
+            st.session_state.submitted_targets[(header_name, month_sel, year_sel)] = {
+                "Sales": sales_t, "SIP": sip_t, "Insurance": insurance_t, "New Clients": new_clients_t,
+                "submitted_at": pd.Timestamp.now(),
+            }
+            st.success(f"Target submitted for {header_name} — {month_sel} {year_sel}. You can resubmit anytime to update it.")
+
+    key = (header_name, month_sel, year_sel)
+    if key in st.session_state.submitted_targets:
+        st.markdown("---")
+        st.markdown("**Currently submitted (this session)**")
+        sub = st.session_state.submitted_targets[key]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Sales", format_inr(sub["Sales"]))
+        c2.metric("SIP", format_inr(sub["SIP"]))
+        c3.metric("Insurance", format_inr(sub["Insurance"]))
+        c4.metric("New Clients", format_count(sub["New Clients"]))
+        sub_df = pd.DataFrame([{**{k: v for k, v in sub.items() if k != "submitted_at"},
+                                 "Partner": header_name, "Period": f"{month_sel} {year_sel}"}])
+        st.download_button("Download as CSV", sub_df.to_csv(index=False).encode("utf-8"),
+                            file_name="final_target_submission.csv", mime="text/csv")
+
+
+# ===========================================================================
+# SECTION 13 — ACTION TRACKER
+# ===========================================================================
+elif section.startswith("13."):
     st.subheader("Action Tracker")
 
     if reviews.empty:
@@ -584,13 +862,6 @@ elif section.startswith("9."):
         c3.metric("Completed", int((show["status"] == "Completed").sum()))
         c4.metric("Overdue", int(show["overdue"].sum()))
 
-        def style_status(row):
-            if row["overdue"]:
-                return ["background-color:#fde2e2"] * len(row)
-            if row["status"] == "Completed":
-                return ["background-color:#e3f5e6"] * len(row)
-            return [""] * len(row)
-
         table = show[["partner_name", "action_item", "owner", "due_date", "status", "remarks"]].rename(columns={
             "partner_name": "Partner", "action_item": "Action", "owner": "Owner",
             "due_date": "Due Date", "status": "Status", "remarks": "Remarks",
@@ -601,33 +872,54 @@ elif section.startswith("9."):
 
 
 # ===========================================================================
-# SECTION 10 — DOWNLOAD / REPORTS
+# SECTION 14 — DOWNLOAD / REPORTS
 # ===========================================================================
-elif section.startswith("10."):
+elif section.startswith("14."):
     st.subheader("Download / Reports")
-    st.caption("Export the current filtered view (Partner/RM/Cluster/Region + Period) as CSV.")
+    st.caption("Export the current filtered view (Partner/RM/Cluster/Region + Period).")
 
+    opps = {
+        "SIP Opportunity": calc.sip_opportunity(clients, txns_all_time),
+        "Cross-sell Opportunity": calc.cross_sell_opportunity(clients, txns_all_time, "Mutual Funds", "Insurance"),
+        "Dormant Clients": calc.dormant_opportunity(clients),
+        "High-Value Low-Pen": calc.high_value_low_penetration(clients, txns_all_time),
+    }
+    insights_for_pdf = calc.generate_insights(kpis, target_summary, {
+        "sip_opp": opps["SIP Opportunity"], "cross_sell": opps["Cross-sell Opportunity"],
+        "dormant": opps["Dormant Clients"], "high_value": opps["High-Value Low-Pen"],
+    }, calc.growth_pct(kpis["aum"], kpis_prev["aum"]))
+
+    st.markdown("**Combined reports**")
+    rc1, rc2 = st.columns(2)
+    excel_bytes = report_export.build_excel_report(
+        header_name, f"{month_sel} {year_sel}", kpis, target_summary,
+        txns_month.groupby("product_category")["amount"].sum().reset_index(), clients, opps, reviews,
+    )
+    rc1.download_button("📊 Download Excel Report (multi-sheet)", excel_bytes,
+                         file_name=f"partner360_report_{month_sel}_{year_sel}.xlsx",
+                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    pdf_bytes = report_export.build_pdf_report(header_name, f"{month_sel} {year_sel}", kpis, target_summary, insights_for_pdf)
+    rc2.download_button("📄 Download PDF Summary", pdf_bytes,
+                         file_name=f"partner360_summary_{month_sel}_{year_sel}.pdf", mime="application/pdf")
+
+    st.markdown("---")
+    st.markdown("**Individual CSVs**")
     exports = {
         "Partner Summary (KPIs)": pd.DataFrame([kpis]),
         "Target vs Achievement": target_summary,
         "Product Performance": txns_month.groupby("product_category")["amount"].sum().reset_index(),
         "Client List": clients,
-        "Client Opportunities (SIP)": calc.sip_opportunity(clients, txns_all_time),
-        "Review Summary": reviews,
+        **opps,
+        "Review History": reviews,
     }
-
     for label, df in exports.items():
         col1, col2 = st.columns([3, 1])
         col1.write(f"**{label}** — {len(df)} rows")
         col2.download_button(
-            "Download CSV", df.to_csv(index=False).encode("utf-8"),
+            "CSV", df.to_csv(index=False).encode("utf-8"),
             file_name=f"{label.lower().replace(' ', '_').replace('(', '').replace(')', '')}.csv",
             mime="text/csv", key=label,
         )
-
-    st.info("Excel (multi-sheet) and PDF export can be added with openpyxl / xlsxwriter and reportlab once "
-            "the report layouts are finalized with the business team — see README Phase 3+.")
-
-
 st.markdown("---")
 st.caption("Partner 360 Dashboard · Phase 1 Prototype · Data shown is randomly generated dummy data, not real business figures.")
